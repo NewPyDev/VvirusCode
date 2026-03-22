@@ -11,7 +11,7 @@ on:
 jobs:
   fetch-code:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -23,16 +23,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: |
-          pip install selenium requests
-
-      - name: Set up Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-
-      - name: Set up ChromeDriver
-        uses: nanasess/setup-chromedriver@v2
+        run: pip install requests
 
       - name: Run AirMax code fetcher
         env:
