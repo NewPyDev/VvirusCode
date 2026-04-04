@@ -18,7 +18,12 @@ import logging
 import requests
 from datetime import datetime
 from playwright.sync_api import sync_playwright
+from pathlib import Path
 import time
+
+# File to persist the last fetched code (lives next to this script)
+SCRIPT_DIR = Path(__file__).resolve().parent
+LAST_CODE_FILE = SCRIPT_DIR / "last_code.txt"
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -142,7 +147,9 @@ def fetch_code() -> str | None:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
+            # Disable cache so we always get fresh content
             context = browser.new_context()
+            context.set_extra_http_headers({"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"})
             page = context.new_page()
 
             logger.info(f"Navigating to Codes list: {CODES_LIST_URL}")
@@ -212,11 +219,35 @@ def fetch_code() -> str | None:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def load_last_code() -> str | None:
+    """Load the previously fetched code from disk."""
+    try:
+        if LAST_CODE_FILE.exists():
+            code = LAST_CODE_FILE.read_text().strip()
+            if code:
+                logger.info(f"Last saved code: {code}")
+                return code
+    except Exception as e:
+        logger.warning(f"Could not read last code file: {e}")
+    return None
+
+
+def save_last_code(code: str) -> None:
+    """Persist the fetched code to disk for next-run comparison."""
+    try:
+        LAST_CODE_FILE.write_text(code)
+        logger.info(f"Saved code to {LAST_CODE_FILE}")
+    except Exception as e:
+        logger.warning(f"Could not save last code file: {e}")
+
+
 def main():
     logger.info("=" * 50)
     logger.info("AirMax TV Code Fetcher — Starting")
     logger.info(f"Date: {datetime.now():%Y-%m-%d %H:%M:%S}")
     logger.info("=" * 50)
+
+    previous_code = load_last_code()
 
     code = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -225,22 +256,31 @@ def main():
         if code:
             break
         if attempt < MAX_RETRIES:
-            import time
             logger.info("Retrying in 15 seconds...")
             time.sleep(15)
 
-    if code:
+    if not code:
+        message = "AirMax TV weekly code could not be extracted."
+        print(f"\n  {message}")
+        send_telegram_message(
+            f"WARNING: {message}\nManual check required at: {CODE_PAGE_URL}"
+        )
+    elif code == previous_code:
+        logger.warning(f"Code {code} is the SAME as last week!")
+        message = (
+            f"WARNING: AirMax TV code has NOT changed yet ({code}).\n"
+            f"The website may not have updated. Check manually:\n{CODES_LIST_URL}"
+        )
+        print(f"\n  {message}")
+        send_telegram_message(message)
+    else:
+        # New code! Save it and send it.
+        save_last_code(code)
         message = f"AirMax TV weekly code: {code}"
         print(f"\n{'='*40}")
         print(f" {message}")
         print(f"{'='*40}\n")
         send_telegram_message(message)
-    else:
-        message = "AirMax TV weekly code could not be extracted."
-        print(f"\n  {message}")
-        send_telegram_message(
-            f" {message}\nManual check required at: {CODE_PAGE_URL}"
-        )
 
     logger.info("Done.")
 
