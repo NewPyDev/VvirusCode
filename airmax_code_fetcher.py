@@ -142,42 +142,68 @@ def fetch_code() -> str | None:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            
-            # Start with CODES_LIST_URL, fallback to CODE_PAGE_URL if needed
-            for url_label, url in [("Codes list", CODES_LIST_URL), ("Final page", CODE_PAGE_URL)]:
-                logger.info(f"Navigating to {url_label}: {url}")
+            context = browser.new_context()
+            page = context.new_page()
+
+            logger.info(f"Navigating to Codes list: {CODES_LIST_URL}")
+            page.goto(CODES_LIST_URL, wait_until='networkidle', timeout=60000)
+
+            logger.info("Waiting 35 seconds for the countdown...")
+            for _ in range(35):
+                page.evaluate("window.scrollBy(0, 200)")
+                page.wait_for_timeout(1000)
+
+            # ── Attempt 1: click button and catch the popup tab ──────────
+            loc = page.locator('.cta-pro')
+            popup_page = None
+            if loc.count() > 0:
+                logger.info("Found .cta-pro button — clicking with expect_popup...")
                 try:
-                    page.goto(url, wait_until='networkidle', timeout=60000)
-                    
-                    logger.info("Waiting 35 seconds for the countdown...")
-                    # Scroll slowly to simulate a user
-                    for _ in range(35):
-                        page.evaluate("window.scrollBy(0, 200)")
-                        page.wait_for_timeout(1000)
-                        
-                    loc = page.locator('.cta-pro')
-                    if loc.count() > 0:
-                        logger.info("Found .cta-pro button! Clicking it...")
+                    with context.expect_page(timeout=15000) as popup_info:
                         loc.first.click(force=True)
-                        logger.info("Waiting for navigation to final page...")
-                        page.wait_for_timeout(10000)
-                    else:
-                        logger.warning("Button .cta-pro not found! Proceeding anyway to check page.")
-                        
-                    # Check all opened pages/tabs in the context for the code
-                    for pg in browser.contexts[0].pages:
-                        logger.info(f"Checking URL for code: {pg.url}")
-                        html = pg.content()
-                        code = extract_code_from_html(html)
-                        if code:
-                            browser.close()
-                            return code
-                            
-                    logger.warning(f"No code found using {url_label}.")
+                    popup_page = popup_info.value
+                    popup_page.wait_for_load_state('networkidle', timeout=15000)
+                    logger.info(f"Popup opened: {popup_page.url}")
                 except Exception as e:
-                    logger.error(f"Failed to fetch {url_label}: {e}")
-                    
+                    logger.warning(f"Popup did not open: {e}")
+
+            # ── Attempt 2: extract redirect URL from page JS / HTML ──────
+            if popup_page is None:
+                logger.info("Trying to extract redirect URL from page source...")
+                redirect_url = page.evaluate("""() => {
+                    // Look for the target URL in onclick handlers or href attributes
+                    var btn = document.querySelector('.cta-pro');
+                    if (btn) {
+                        var onclick = btn.getAttribute('onclick') || '';
+                        var m = onclick.match(/https?:\\/\\/[^'"\\s]+/);
+                        if (m) return m[0];
+                    }
+                    // Search all scripts for the redirect URL pattern
+                    var scripts = document.querySelectorAll('script');
+                    for (var i = 0; i < scripts.length; i++) {
+                        var t = scripts[i].textContent || '';
+                        var m = t.match(/https?:\\/\\/www\\.vviruslove\\.com\\/[a-z0-9]+\\/\\?utm_source=airmax/);
+                        if (m) return m[0];
+                    }
+                    return null;
+                }""")
+                if redirect_url:
+                    logger.info(f"Found redirect URL in page source: {redirect_url}")
+                    popup_page = context.new_page()
+                    popup_page.goto(redirect_url, wait_until='networkidle', timeout=30000)
+                else:
+                    logger.warning("Could not extract redirect URL from page source.")
+
+            # ── Check all tabs for the code ──────────────────────────────
+            for pg in context.pages:
+                logger.info(f"Checking tab for code: {pg.url}")
+                html = pg.content()
+                code = extract_code_from_html(html)
+                if code:
+                    browser.close()
+                    return code
+
+            logger.warning("No code found in any tab.")
             browser.close()
             return None
     except Exception as e:
