@@ -2,12 +2,17 @@
 AirMax TV Weekly Activation Code Fetcher
 =========================================
 Extracts the weekly AirMax TV activation code from VVirusLove
-and sends it to Telegram.
+using the WordPress REST API (no browser needed).
+
+The real activation code lives on a weekly-rotating WordPress PAGE
+(not a post) with a dynamic slug (e.g., 'aaaaa22aaa3a').
+The code is embedded as an image filename: /uploads/2026/04/4985088380.jpg
+
+This script discovers the page via the WP pages API, then extracts
+the code from the image filename in the page content.
 
 Requirements:
-    uv pip install requests beautifulsoup4
-
-No browser/Selenium needed — the code is embedded in the page HTML.
+    pip install requests beautifulsoup4
 """
 
 import os
@@ -17,7 +22,6 @@ sys.stdout.reconfigure(encoding='utf-8')
 import logging
 import requests
 from datetime import datetime
-from playwright.sync_api import sync_playwright
 from pathlib import Path
 import time
 
@@ -30,13 +34,19 @@ LAST_CODE_FILE = SCRIPT_DIR / "last_code.txt"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# The final page that contains the activation code directly
-CODE_PAGE_URL = "https://www.vviruslove.com/%d8%aa%d9%81%d8%b9%d9%8a%d9%84-%d9%83%d9%88%d8%af-%d8%aa%d8%b7%d8%a8%d9%8a%d9%82-airmax-tv-%d9%84%d9%85%d8%af%d9%89-%d8%a7%d9%84%d8%ad%d9%8a%d8%a7%d9%87-%d9%84%d9%85%d8%b4%d8%a7%d9%87%d8%af%d8%a9/"
+# WordPress REST API endpoints
+# The activation code is on a PAGE (not a post) with a weekly-rotating slug.
+# We fetch recent pages sorted by modification date to find the current one.
+WP_PAGES_API = (
+    "https://www.vviruslove.com/wp-json/wp/v2/pages"
+    "?per_page=20&orderby=modified&order=desc"
+    "&_fields=id,title,date,modified,link,slug,content"
+)
 
-# Fallback: the intermediate page (codes listing)
-CODES_LIST_URL = (
+# Direct page URL (used only in Telegram messages for manual reference)
+CODE_PAGE_URL = (
     "https://www.vviruslove.com/"
-    "2-%d9%83%d9%88%d8%af-%d8%aa%d9%81%d8%b9%d9%8a%d9%84-code-airmax-2026-2025-2/"
+    "2-%d9%83%d9%88%d8%af-%d8%aa%d9%81%d8%b9%d9%8a%d9%84-code-airmax-2026-2025/"
 )
 
 MAX_RETRIES     = 3
@@ -48,6 +58,7 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ar,en;q=0.9",
+    "Accept": "application/json",
 }
 
 # Logging
@@ -81,141 +92,134 @@ def send_telegram_message(text: str) -> bool:
 
 # ─── Code Extraction ──────────────────────────────────────────────────────────
 
-def extract_code_from_html(html: str) -> str | None:
+def extract_activation_code(html: str) -> str | None:
     """
-    Extract the activation code from page HTML using multiple strategies:
-
-    1. Image filename scoped to the CURRENT month  ← BUG FIX
-       (e.g. /uploads/2026/04/6597416103.jpg)
-    2. Text pattern near  "كود التفعيل"
-    3. Any standalone 8-12 digit number in the relevant section
+    Extract the REAL activation code from the weekly code page HTML.
+    
+    The code is embedded as an image filename in the page content.
+    Pattern: /uploads/YYYY/MM/<CODE>.jpg
+    
+    The first image after "تم تجهيز كود التفعيل الخاص بك airMAX" is the AirMax TV code.
     """
-
-    now   = datetime.now()
-    year  = now.strftime("%Y")   # e.g. "2026"
-    month = now.strftime("%m")   # e.g. "04"
-
-    # ── Strategy 1 (FIXED): Image filename scoped to current month ────────────
-    # Previously used \d{4}/\d{2}/ which matched ANY month, so it always
-    # returned the first (often outdated) image found in the page HTML.
-    # Now we pin to the current year/month so we only pick up this week's image.
-    pattern_img = rf"/uploads/{year}/\d{{2}}/(\d{{8,12}})\.(?:jpg|png|webp|avif)"
-    match = re.search(pattern_img, html)
-    if match:
-        code = match.group(1)
-        logger.info(f"Code found in image filename ({year}/{month}): {code}")
-        return code
-    else:
-        logger.warning(
-            f"Strategy 1: no image found under /uploads/{year}/. "
-            "Falling back to other strategies."
-        )
-
-    # ── Strategy 2: "كود التفعيل" followed by digits ─────────────────────────
-    match = re.search(r"كود[_ ]التفعيل[:\s]*(\d{6,12})", html)
-    if match:
-        code = match.group(1)
-        logger.info(f"Code found near 'كود التفعيل': {code}")
-        return code
-
-    # ── Strategy 3: تحميل الكود link with code in URL ────────────────────────
-    match = re.search(r"تحميل الكود.*?(\d{8,12})", html, re.DOTALL)
-    if match:
-        code = match.group(1)
-        logger.info(f"Code found in download link: {code}")
-        return code
-
-    # ── Strategy 4: Any 10-digit number in the code section ──────────────────
-    code_section = re.search(
-        r"تم تجهيز كود التفعيل(.{0,2000})",
+    
+    # ── Strategy 1: Image filename in the airMAX section ─────────────────────
+    # Look for the first code image after the airMAX heading (not airMAX Pro)
+    airmax_section = re.search(
+        r'تم تجهيز كود التفعيل الخاص بك airMAX</h1>.*?'
+        r'src=\\"https?://www\.vviruslove\.com/wp-content/uploads/(\d{4})/(\d{2})/([^"\\]+)\.jpg\\"',
         html,
         re.DOTALL,
     )
-    if code_section:
-        numbers = re.findall(r"\b(\d{10})\b", code_section.group(1))
-        if numbers:
-            code = numbers[0]
-            logger.info(f"Code found as 10-digit number: {code}")
-            return code
+    if airmax_section:
+        code = airmax_section.group(3)
+        logger.info(f"Code found in airMAX section image: {code}")
+        return code
+
+    # ── Strategy 2: Any activation code image in current year ────────────────
+    now = datetime.now()
+    year = now.strftime("%Y")
+    # Match image filenames that are pure digits (the activation code)
+    pattern = rf'/uploads/{year}/\d{{2}}/(\d{{6,12}})\.jpg'
+    matches = re.findall(pattern, html)
+    if matches:
+        code = matches[0]
+        logger.info(f"Code found in image filename ({year}): {code}")
+        return code
+
+    # ── Strategy 3: Any image filename that looks like a code ────────────────
+    # Some codes may be alphanumeric (e.g., "3C08EC" for Pro)
+    pattern_any = rf'/uploads/{year}/\d{{2}}/([A-Za-z0-9]{{4,12}})\.jpg'
+    matches = re.findall(pattern_any, html)
+    if matches:
+        # Filter out known non-code filenames
+        for m in matches:
+            if m.lower() not in ('screenshot_1', 'activation-code'):
+                code = m
+                logger.info(f"Code found in image filename (alphanumeric): {code}")
+                return code
+
+    # ── Strategy 4: Fallback — look for "كود التفعيل" text near digits ───────
+    match = re.search(r'كود التفعيل.*?(\d{6,12})', html, re.DOTALL)
+    if match:
+        code = match.group(1)
+        logger.info(f"Code found near 'كود التفعيل' text: {code}")
+        return code
 
     return None
+
+
+def is_activation_page(content: str) -> bool:
+    """Check if a WordPress page is the weekly activation code page."""
+    # The activation page contains this distinctive heading
+    markers = [
+        'تم تجهيز كود التفعيل',      # "Activation code has been prepared"
+        'كود التفعيل الخاص بك airMAX',  # "Your airMAX activation code"
+        'هذا الكود خاص فقط لتطبيق AirMaxTV',  # "This code is only for AirMaxTV"
+    ]
+    return any(marker in content for marker in markers)
 
 # ─── Fetcher ──────────────────────────────────────────────────────────────────
 
 def fetch_code() -> str | None:
-    """Fetch the activation code from VVirusLove using Playwright."""
+    """
+    Fetch the activation code from VVirusLove using the WordPress REST API.
+    
+    The real code lives on a weekly-rotating WordPress PAGE (not post)
+    with a dynamic slug. We find it by scanning recent pages for the
+    activation code section, then extract the code from the image filename.
+    """
+    logger.info(f"Querying WordPress Pages API: {WP_PAGES_API}")
+
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            # Disable cache so we always get fresh content
-            context = browser.new_context()
-            context.set_extra_http_headers({"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"})
-            page = context.new_page()
-
-            logger.info(f"Navigating to Codes list: {CODES_LIST_URL}")
-            page.goto(CODES_LIST_URL, wait_until='networkidle', timeout=60000)
-
-            logger.info("Waiting 35 seconds for the countdown...")
-            for _ in range(35):
-                page.evaluate("window.scrollBy(0, 200)")
-                page.wait_for_timeout(1000)
-
-            # ── Attempt 1: click button and catch the popup tab ──────────
-            loc = page.locator('.cta-pro')
-            popup_page = None
-            if loc.count() > 0:
-                logger.info("Found .cta-pro button — clicking with expect_popup...")
-                try:
-                    with context.expect_page(timeout=15000) as popup_info:
-                        loc.first.click(force=True)
-                    popup_page = popup_info.value
-                    popup_page.wait_for_load_state('networkidle', timeout=15000)
-                    logger.info(f"Popup opened: {popup_page.url}")
-                except Exception as e:
-                    logger.warning(f"Popup did not open: {e}")
-
-            # ── Attempt 2: extract redirect URL from page JS / HTML ──────
-            if popup_page is None:
-                logger.info("Trying to extract redirect URL from page source...")
-                redirect_url = page.evaluate("""() => {
-                    // Look for the target URL in onclick handlers or href attributes
-                    var btn = document.querySelector('.cta-pro');
-                    if (btn) {
-                        var onclick = btn.getAttribute('onclick') || '';
-                        var m = onclick.match(/https?:\\/\\/[^'"\\s]+/);
-                        if (m) return m[0];
-                    }
-                    // Search all scripts for the redirect URL pattern
-                    var scripts = document.querySelectorAll('script');
-                    for (var i = 0; i < scripts.length; i++) {
-                        var t = scripts[i].textContent || '';
-                        var m = t.match(/https?:\\/\\/www\\.vviruslove\\.com\\/[a-z0-9]+\\/\\?utm_source=airmax/);
-                        if (m) return m[0];
-                    }
-                    return null;
-                }""")
-                if redirect_url:
-                    logger.info(f"Found redirect URL in page source: {redirect_url}")
-                    popup_page = context.new_page()
-                    popup_page.goto(redirect_url, wait_until='networkidle', timeout=30000)
-                else:
-                    logger.warning("Could not extract redirect URL from page source.")
-
-            # ── Check all tabs for the code ──────────────────────────────
-            for pg in context.pages:
-                logger.info(f"Checking tab for code: {pg.url}")
-                html = pg.content()
-                code = extract_code_from_html(html)
-                if code:
-                    browser.close()
-                    return code
-
-            logger.warning("No code found in any tab.")
-            browser.close()
-            return None
-    except Exception as e:
-        logger.error(f"Failed during Playwright execution: {e}")
+        resp = requests.get(WP_PAGES_API, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"API request failed: {e}")
         return None
+
+    try:
+        pages = resp.json()
+    except ValueError as e:
+        logger.error(f"Failed to parse API response as JSON: {e}")
+        return None
+
+    if not pages:
+        logger.warning("API returned no pages.")
+        return None
+
+    logger.info(f"API returned {len(pages)} page(s). Scanning for activation code page...")
+
+    for page in pages:
+        page_id  = page.get("id", "?")
+        title    = page.get("title", {}).get("rendered", "No title")
+        slug     = page.get("slug", "")
+        modified = page.get("modified", "")
+        link     = page.get("link", "")
+        content  = page.get("content", {}).get("rendered", "")
+
+        if not content:
+            continue
+
+        # Check if this page is the activation code page
+        if not is_activation_page(content):
+            continue
+
+        logger.info(f"  >>> Found activation page!")
+        logger.info(f"      Page #{page_id}: {title}")
+        logger.info(f"      Slug: {slug}")
+        logger.info(f"      Modified: {modified}")
+        logger.info(f"      Link: {link}")
+        logger.info(f"      Content length: {len(content)} chars")
+
+        code = extract_activation_code(content)
+        if code:
+            logger.info(f"  >>> Extracted activation code: {code}")
+            return code
+        else:
+            logger.warning(f"  Page #{page_id} matched markers but no code found in images.")
+
+    logger.warning("No activation code page found in recent pages.")
+    return None
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -243,7 +247,7 @@ def save_last_code(code: str) -> None:
 
 def main():
     logger.info("=" * 50)
-    logger.info("AirMax TV Code Fetcher — Starting")
+    logger.info("AirMax TV Code Fetcher — Starting (API mode)")
     logger.info(f"Date: {datetime.now():%Y-%m-%d %H:%M:%S}")
     logger.info("=" * 50)
 
@@ -256,8 +260,8 @@ def main():
         if code:
             break
         if attempt < MAX_RETRIES:
-            logger.info("Retrying in 15 seconds...")
-            time.sleep(15)
+            logger.info("Retrying in 10 seconds...")
+            time.sleep(10)
 
     if not code:
         message = "AirMax TV weekly code could not be extracted."
@@ -269,7 +273,7 @@ def main():
         logger.warning(f"Code {code} is the SAME as last week!")
         message = (
             f"WARNING: AirMax TV code has NOT changed yet ({code}).\n"
-            f"The website may not have updated. Check manually:\n{CODES_LIST_URL}"
+            f"The website may not have updated. Check manually:\n{CODE_PAGE_URL}"
         )
         print(f"\n  {message}")
         send_telegram_message(message)
@@ -278,7 +282,7 @@ def main():
         save_last_code(code)
         message = f"AirMax TV weekly code: {code}"
         print(f"\n{'='*40}")
-        print(f" {message}")
+        print(f"  {message}")
         print(f"{'='*40}\n")
         send_telegram_message(message)
 
