@@ -18,6 +18,7 @@ Requirements:
 import os
 import re
 import sys
+import json
 sys.stdout.reconfigure(encoding='utf-8')
 import logging
 import requests
@@ -75,7 +76,7 @@ def send_telegram_message(text: str) -> bool:
     """Send a message to the configured Telegram chat."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials not configured. Skipping send.")
-        print(f"\n>>> MESSAGE (not sent): {text}")
+        print(f"\n>>> MESSAGE (not sent):\n{text}")
         return False
 
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -92,61 +93,54 @@ def send_telegram_message(text: str) -> bool:
 
 # ─── Code Extraction ──────────────────────────────────────────────────────────
 
-def extract_activation_code(html: str) -> str | None:
+def extract_activation_code(html: str) -> dict | None:
     """
-    Extract the REAL activation code from the weekly code page HTML.
-    
-    The code is embedded as an image filename in the page content.
-    Pattern: /uploads/YYYY/MM/<CODE>.jpg
-    
-    The first image after "تم تجهيز كود التفعيل الخاص بك airMAX" is the AirMax TV code.
+    Extract both AirMax TV and AirMax TV Pro activation codes.
+    Returns a dict with 'airmax' and 'pro' keys.
     """
-    
-    # ── Strategy 1: Image filename in the airMAX section ─────────────────────
-    # Look for the first code image after the airMAX heading (not airMAX Pro)
-    airmax_section = re.search(
-        r'تم تجهيز كود التفعيل الخاص بك airMAX</h1>.*?'
-        r'src=\\"https?://www\.vviruslove\.com/wp-content/uploads/(\d{4})/(\d{2})/([^"\\]+)\.jpg\\"',
+    codes = {'airmax': None, 'pro': None}
+
+    # ── Extract AirMax TV code ─────────────────────
+    airmax_match = re.search(
+        r'كود التفعيل الخاص بك airMAX[^a-zA-Z].*?'
+        r'src=[\"\']https?://(?:www\.)?vviruslove\.com/wp-content/uploads/\d{4}/\d{2}/([^\"\']+)\.jpg[\"\']',
         html,
-        re.DOTALL,
+        re.DOTALL | re.IGNORECASE
     )
-    if airmax_section:
-        code = airmax_section.group(3)
-        logger.info(f"Code found in airMAX section image: {code}")
-        return code
+    if airmax_match:
+        codes['airmax'] = airmax_match.group(1)
+        logger.info(f"AirMax TV Code found: {codes['airmax']}")
+    else:
+        # Fallback 1: Any code image
+        fallback = re.search(r'/uploads/\d{4}/\d{2}/(\d{6,12})\.jpg', html)
+        if fallback:
+            codes['airmax'] = fallback.group(1)
+            logger.info(f"AirMax TV Code found via fallback: {codes['airmax']}")
 
-    # ── Strategy 2: Any activation code image in current year ────────────────
-    now = datetime.now()
-    year = now.strftime("%Y")
-    # Match image filenames that are pure digits (the activation code)
-    pattern = rf'/uploads/{year}/\d{{2}}/(\d{{6,12}})\.jpg'
-    matches = re.findall(pattern, html)
-    if matches:
-        code = matches[0]
-        logger.info(f"Code found in image filename ({year}): {code}")
-        return code
+    # ── Extract AirMax TV PRO code ─────────────────
+    pro_match = re.search(
+        r'كود التفعيل الخاص بك airMAX Pro.*?'
+        r'src=[\"\']https?://(?:www\.)?vviruslove\.com/wp-content/uploads/\d{4}/\d{2}/([^\"\']+)\.jpg[\"\']',
+        html,
+        re.DOTALL | re.IGNORECASE
+    )
+    if pro_match:
+        codes['pro'] = pro_match.group(1)
+        logger.info(f"AirMax TV PRO Code found: {codes['pro']}")
+    else:
+        # Fallback for PRO (often alphanumeric like 3C08EC)
+        fallback_pro = re.findall(r'/uploads/\d{4}/\d{2}/([A-Za-z0-9]{4,12})\.jpg', html)
+        for m in fallback_pro:
+            if m.lower() not in ('screenshot_1', 'activation-code') and not m.isdigit():
+                codes['pro'] = m
+                logger.info(f"AirMax TV PRO Code found via fallback: {codes['pro']}")
+                break
 
-    # ── Strategy 3: Any image filename that looks like a code ────────────────
-    # Some codes may be alphanumeric (e.g., "3C08EC" for Pro)
-    pattern_any = rf'/uploads/{year}/\d{{2}}/([A-Za-z0-9]{{4,12}})\.jpg'
-    matches = re.findall(pattern_any, html)
-    if matches:
-        # Filter out known non-code filenames
-        for m in matches:
-            if m.lower() not in ('screenshot_1', 'activation-code'):
-                code = m
-                logger.info(f"Code found in image filename (alphanumeric): {code}")
-                return code
-
-    # ── Strategy 4: Fallback — look for "كود التفعيل" text near digits ───────
-    match = re.search(r'كود التفعيل.*?(\d{6,12})', html, re.DOTALL)
-    if match:
-        code = match.group(1)
-        logger.info(f"Code found near 'كود التفعيل' text: {code}")
-        return code
+    # If we found at least one code, return the dict.
+    if codes['airmax'] or codes['pro']:
+        return codes
 
     return None
-
 
 def is_activation_page(content: str) -> bool:
     """Check if a WordPress page is the weekly activation code page."""
@@ -160,13 +154,9 @@ def is_activation_page(content: str) -> bool:
 
 # ─── Fetcher ──────────────────────────────────────────────────────────────────
 
-def fetch_code() -> str | None:
+def fetch_code() -> dict | None:
     """
-    Fetch the activation code from VVirusLove using the WordPress REST API.
-    
-    The real code lives on a weekly-rotating WordPress PAGE (not post)
-    with a dynamic slug. We find it by scanning recent pages for the
-    activation code section, then extract the code from the image filename.
+    Fetch the activation codes from VVirusLove using the WordPress REST API.
     """
     logger.info(f"Querying WordPress Pages API: {WP_PAGES_API}")
 
@@ -209,12 +199,11 @@ def fetch_code() -> str | None:
         logger.info(f"      Slug: {slug}")
         logger.info(f"      Modified: {modified}")
         logger.info(f"      Link: {link}")
-        logger.info(f"      Content length: {len(content)} chars")
 
-        code = extract_activation_code(content)
-        if code:
-            logger.info(f"  >>> Extracted activation code: {code}")
-            return code
+        codes = extract_activation_code(content)
+        if codes:
+            logger.info(f"  >>> Extracted activation codes: {codes}")
+            return codes
         else:
             logger.warning(f"  Page #{page_id} matched markers but no code found in images.")
 
@@ -223,24 +212,28 @@ def fetch_code() -> str | None:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def load_last_code() -> str | None:
-    """Load the previously fetched code from disk."""
+def load_last_code() -> dict | None:
+    """Load the previously fetched code(s) from disk."""
     try:
         if LAST_CODE_FILE.exists():
-            code = LAST_CODE_FILE.read_text().strip()
-            if code:
-                logger.info(f"Last saved code: {code}")
-                return code
+            content = LAST_CODE_FILE.read_text().strip()
+            if content:
+                # Handle old format (just string '4985088380') or new JSON format
+                if "{" in content:
+                    return json.loads(content)
+                else:
+                    return {'airmax': content, 'pro': None}
     except Exception as e:
         logger.warning(f"Could not read last code file: {e}")
     return None
 
 
-def save_last_code(code: str) -> None:
-    """Persist the fetched code to disk for next-run comparison."""
+def save_last_code(codes: dict) -> None:
+    """Persist the fetched code(s) to disk for next-run comparison."""
     try:
-        LAST_CODE_FILE.write_text(code)
-        logger.info(f"Saved code to {LAST_CODE_FILE}")
+        content = json.dumps(codes)
+        LAST_CODE_FILE.write_text(content)
+        logger.info(f"Saved codes to {LAST_CODE_FILE}")
     except Exception as e:
         logger.warning(f"Could not save last code file: {e}")
 
@@ -251,38 +244,49 @@ def main():
     logger.info(f"Date: {datetime.now():%Y-%m-%d %H:%M:%S}")
     logger.info("=" * 50)
 
-    previous_code = load_last_code()
+    previous_codes = load_last_code()
 
-    code = None
+    codes = None
     for attempt in range(1, MAX_RETRIES + 1):
         logger.info(f"Attempt {attempt}/{MAX_RETRIES}...")
-        code = fetch_code()
-        if code:
+        codes = fetch_code()
+        if codes:
             break
         if attempt < MAX_RETRIES:
             logger.info("Retrying in 10 seconds...")
             time.sleep(10)
 
-    if not code:
-        message = "AirMax TV weekly code could not be extracted."
+    if not codes:
+        message = "AirMax TV weekly code(s) could not be extracted."
         print(f"\n  {message}")
         send_telegram_message(
             f"WARNING: {message}\nManual check required at: {CODE_PAGE_URL}"
         )
-    elif code == previous_code:
-        logger.warning(f"Code {code} is the SAME as last week!")
+    elif codes == previous_codes:
+        logger.warning(f"Codes {codes} perfectly matched the ones from last week!")
         message = (
-            f"WARNING: AirMax TV code has NOT changed yet ({code}).\n"
+            f"WARNING: AirMax TV codes have NOT changed yet.\n"
+            f"AirMax TV: {codes.get('airmax', 'N/A')}\n"
+            f"AirMax Pro: {codes.get('pro', 'N/A')}\n\n"
             f"The website may not have updated. Check manually:\n{CODE_PAGE_URL}"
         )
         print(f"\n  {message}")
         send_telegram_message(message)
     else:
         # New code! Save it and send it.
-        save_last_code(code)
-        message = f"AirMax TV weekly code: {code}"
+        save_last_code(codes)
+        airmax_msg = codes.get('airmax') or "N/A"
+        pro_msg = codes.get('pro') or "N/A"
+        
+        message = (
+            f"🎉 New AirMax Codes Released! 🎉\n\n"
+            f"📺 AirMax TV: {airmax_msg}\n"
+            f"🌟 AirMax PRO: {pro_msg}\n\n"
+            f"Enjoy your free shows! 🎬"
+        )
+        
         print(f"\n{'='*40}")
-        print(f"  {message}")
+        print(message)
         print(f"{'='*40}\n")
         send_telegram_message(message)
 
