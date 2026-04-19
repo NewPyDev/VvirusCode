@@ -103,7 +103,7 @@ def extract_activation_code(html: str) -> dict | None:
     # ── Extract AirMax TV code ─────────────────────
     airmax_match = re.search(
         r'كود التفعيل الخاص بك airMAX[^a-zA-Z].*?'
-        r'src=[\"\']https?://(?:www\.)?vviruslove\.com/wp-content/uploads/\d{4}/\d{2}/([^\"\']+)\.jpg[\"\']',
+        r'src=[\"\']https?://(?:www\.)?vviruslove\.com/wp-content/uploads/\d{4}/\d{2}/([^\"\']+)\.(?:jpg|jpeg|png|webp|avif)[\"\']',
         html,
         re.DOTALL | re.IGNORECASE
     )
@@ -112,7 +112,7 @@ def extract_activation_code(html: str) -> dict | None:
         logger.info(f"AirMax TV Code found: {codes['airmax']}")
     else:
         # Fallback 1: Any code image
-        fallback = re.search(r'/uploads/\d{4}/\d{2}/(\d{6,12})\.jpg', html)
+        fallback = re.search(r'/uploads/\d{4}/\d{2}/(\d{6,12})\.(?:jpg|jpeg|png|webp|avif)', html)
         if fallback:
             codes['airmax'] = fallback.group(1)
             logger.info(f"AirMax TV Code found via fallback: {codes['airmax']}")
@@ -120,7 +120,7 @@ def extract_activation_code(html: str) -> dict | None:
     # ── Extract AirMax TV PRO code ─────────────────
     pro_match = re.search(
         r'كود التفعيل الخاص بك airMAX Pro.*?'
-        r'src=[\"\']https?://(?:www\.)?vviruslove\.com/wp-content/uploads/\d{4}/\d{2}/([^\"\']+)\.jpg[\"\']',
+        r'src=[\"\']https?://(?:www\.)?vviruslove\.com/wp-content/uploads/\d{4}/\d{2}/([^\"\']+)\.(?:jpg|jpeg|png|webp|avif)[\"\']',
         html,
         re.DOTALL | re.IGNORECASE
     )
@@ -129,7 +129,7 @@ def extract_activation_code(html: str) -> dict | None:
         logger.info(f"AirMax TV PRO Code found: {codes['pro']}")
     else:
         # Fallback for PRO (often alphanumeric like 3C08EC)
-        fallback_pro = re.findall(r'/uploads/\d{4}/\d{2}/([A-Za-z0-9]{4,12})\.jpg', html)
+        fallback_pro = re.findall(r'/uploads/\d{4}/\d{2}/([A-Za-z0-9]{4,12})\.(?:jpg|jpeg|png|webp|avif)', html)
         for m in fallback_pro:
             if m.lower() not in ('screenshot_1', 'activation-code') and not m.isdigit():
                 codes['pro'] = m
@@ -142,11 +142,13 @@ def extract_activation_code(html: str) -> dict | None:
 
     return None
 
-def is_activation_page(content: str) -> bool:
-    """Check if a WordPress page is the weekly activation code page."""
-    # The activation page contains this distinctive heading
+def is_activation_page(title: str, content: str) -> bool:
+    """Check if a WordPress page is the weekly activation code page for AirMax TV."""
+    # Ensure this page is specifically for AirMax, not OTTPlayer or other apps.
+    if 'ottplayer' in title.lower() or 'ss player' in title.lower() or 'airmax live' in title.lower():
+        return False
+        
     markers = [
-        'تم تجهيز كود التفعيل',      # "Activation code has been prepared"
         'كود التفعيل الخاص بك airMAX',  # "Your airMAX activation code"
         'هذا الكود خاص فقط لتطبيق AirMaxTV',  # "This code is only for AirMaxTV"
     ]
@@ -191,7 +193,7 @@ def fetch_code() -> dict | None:
             continue
 
         # Check if this page is the activation code page
-        if not is_activation_page(content):
+        if not is_activation_page(title, content):
             continue
 
         logger.info(f"  >>> Found activation page!")
