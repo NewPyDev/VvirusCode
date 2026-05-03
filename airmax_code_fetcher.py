@@ -40,8 +40,16 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 # We fetch recent pages sorted by modification date to find the current one.
 WP_PAGES_API = (
     "https://www.vviruslove.com/wp-json/wp/v2/pages"
-    "?per_page=20&orderby=modified&order=desc"
+    "?per_page=50&orderby=modified&order=desc"
     "&_fields=id,title,date,modified,link,slug,content"
+)
+
+# Known page IDs to fetch directly as fallback (the dynamic weekly pages)
+# These are updated each time the site restructures
+KNOWN_PAGE_IDS = [26400, 26399, 26401]  # aaaa*, zzzz*, oooo* pages
+WP_PAGE_BY_ID = (
+    "https://www.vviruslove.com/wp-json/wp/v2/pages/{page_id}"
+    "?_fields=id,title,date,modified,link,slug,content"
 )
 
 # Direct page URL (used only in Telegram messages for manual reference)
@@ -156,31 +164,8 @@ def is_activation_page(title: str, content: str) -> bool:
 
 # ─── Fetcher ──────────────────────────────────────────────────────────────────
 
-def fetch_code() -> dict | None:
-    """
-    Fetch the activation codes from VVirusLove using the WordPress REST API.
-    """
-    logger.info(f"Querying WordPress Pages API: {WP_PAGES_API}")
-
-    try:
-        resp = requests.get(WP_PAGES_API, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"API request failed: {e}")
-        return None
-
-    try:
-        pages = resp.json()
-    except ValueError as e:
-        logger.error(f"Failed to parse API response as JSON: {e}")
-        return None
-
-    if not pages:
-        logger.warning("API returned no pages.")
-        return None
-
-    logger.info(f"API returned {len(pages)} page(s). Scanning for activation code page...")
-
+def _scan_pages(pages: list) -> dict | None:
+    """Scan a list of WP page dicts for the activation code page."""
     for page in pages:
         page_id  = page.get("id", "?")
         title    = page.get("title", {}).get("rendered", "No title")
@@ -190,10 +175,12 @@ def fetch_code() -> dict | None:
         content  = page.get("content", {}).get("rendered", "")
 
         if not content:
+            logger.debug(f"  Page #{page_id} ({slug}): no content, skipping.")
             continue
 
         # Check if this page is the activation code page
         if not is_activation_page(title, content):
+            logger.debug(f"  Page #{page_id} ({slug}): not an activation page.")
             continue
 
         logger.info(f"  >>> Found activation page!")
@@ -209,7 +196,55 @@ def fetch_code() -> dict | None:
         else:
             logger.warning(f"  Page #{page_id} matched markers but no code found in images.")
 
-    logger.warning("No activation code page found in recent pages.")
+    return None
+
+
+def fetch_code() -> dict | None:
+    """
+    Fetch the activation codes from VVirusLove using the WordPress REST API.
+    Tries two strategies:
+      1. Fetch recent pages sorted by modification date.
+      2. Fetch known page IDs directly (fallback).
+    """
+    # ── Strategy 1: Bulk fetch recent pages ────────────────────────
+    logger.info(f"Strategy 1: Querying WordPress Pages API (recent pages)...")
+
+    try:
+        resp = requests.get(WP_PAGES_API, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        pages = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.error(f"API request failed: {e}")
+        pages = []
+
+    if pages:
+        logger.info(f"API returned {len(pages)} page(s). Scanning for activation code page...")
+        codes = _scan_pages(pages)
+        if codes:
+            return codes
+        logger.warning("No activation code found in recent pages.")
+    else:
+        logger.warning("API returned no pages or request failed.")
+
+    # ── Strategy 2: Fetch known page IDs directly ─────────────────
+    logger.info(f"Strategy 2: Fetching known page IDs directly: {KNOWN_PAGE_IDS}")
+
+    for pid in KNOWN_PAGE_IDS:
+        url = WP_PAGE_BY_ID.format(page_id=pid)
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            page = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            logger.warning(f"  Failed to fetch page {pid}: {e}")
+            continue
+
+        # Wrap in a list for _scan_pages
+        codes = _scan_pages([page])
+        if codes:
+            return codes
+
+    logger.warning("No activation code page found in any strategy.")
     return None
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
