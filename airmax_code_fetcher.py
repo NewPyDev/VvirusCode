@@ -22,7 +22,7 @@ import json
 sys.stdout.reconfigure(encoding='utf-8')
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 
@@ -46,7 +46,7 @@ WP_PAGES_API = (
 
 # Known page IDs to fetch directly as fallback (the dynamic weekly pages)
 # These are updated each time the site restructures
-KNOWN_PAGE_IDS = [26400, 26399, 26401]  # aaaa*, zzzz*, oooo* pages
+KNOWN_PAGE_IDS = [26520, 26519, 26521]  # aaaaa2222a, zzzz11111z, oooo3333oo pages
 WP_PAGE_BY_ID = (
     "https://www.vviruslove.com/wp-json/wp/v2/pages/{page_id}"
     "?_fields=id,title,date,modified,link,slug,content"
@@ -152,8 +152,15 @@ def extract_activation_code(html: str) -> dict | None:
 
 def is_activation_page(title: str, content: str) -> bool:
     """Check if a WordPress page is the weekly activation code page for AirMax TV."""
-    # Ensure this page is specifically for AirMax, not OTTPlayer or other apps.
-    if 'ottplayer' in title.lower() or 'ss player' in title.lower() or 'airmax live' in title.lower():
+    # Filter by TITLE only — the content often has cross-promotion links
+    # to OTTPlayer, SS Player, etc. that would cause false negatives.
+    title_lower = title.lower()
+    if 'ottplayer' in title_lower or 'ss player' in title_lower or 'airmax live' in title_lower:
+        return False
+
+    # The AirMax LIVE page uses "airMAX LIVE" in the activation heading
+    # (e.g. "كود التفعيل الخاص بك airMAX LIVE"), so exclude those too.
+    if re.search(r'كود التفعيل الخاص بك airMAX\s+LIVE', content, re.IGNORECASE):
         return False
         
     markers = [
@@ -293,22 +300,32 @@ def main():
             logger.info("Retrying in 10 seconds...")
             time.sleep(10)
 
+    # The workflow runs 3 times: Sun 03:00, Sun 12:00, Mon 03:00 UTC.
+    # Only send failure/unchanged alerts on the LAST attempt (Monday).
+    # New codes are sent immediately on whichever run finds them.
+    is_last_attempt = datetime.now(timezone.utc).weekday() == 0  # 0 = Monday
+
     if not codes:
         message = "AirMax TV weekly code(s) could not be extracted."
-        print(f"\n  {message}")
-        send_telegram_message(
-            f"WARNING: {message}\nManual check required at: {CODE_PAGE_URL}"
-        )
+        logger.warning(message)
+        if is_last_attempt:
+            send_telegram_message(
+                f"WARNING: {message}\nManual check required at: {CODE_PAGE_URL}"
+            )
+        else:
+            logger.info("Not the last scheduled attempt — will retry on next run.")
     elif codes == previous_codes:
-        logger.warning(f"Codes {codes} perfectly matched the ones from last week!")
-        message = (
-            f"WARNING: AirMax TV codes have NOT changed yet.\n"
-            f"AirMax TV: {codes.get('airmax', 'N/A')}\n"
-            f"AirMax Pro: {codes.get('pro', 'N/A')}\n\n"
-            f"The website may not have updated. Check manually:\n{CODE_PAGE_URL}"
-        )
-        print(f"\n  {message}")
-        send_telegram_message(message)
+        logger.info(f"Codes unchanged: {codes}")
+        if is_last_attempt:
+            message = (
+                f"WARNING: AirMax TV codes have NOT changed yet.\n"
+                f"AirMax TV: {codes.get('airmax', 'N/A')}\n"
+                f"AirMax Pro: {codes.get('pro', 'N/A')}\n\n"
+                f"The website may not have updated. Check manually:\n{CODE_PAGE_URL}"
+            )
+            send_telegram_message(message)
+        else:
+            logger.info("Not the last scheduled attempt — will retry on next run.")
     else:
         # New code! Save it and send it.
         save_last_code(codes)
